@@ -1,11 +1,10 @@
-
-    import os
-    import json
-    import time
-    import re
-    import streamlit as st
-    from PIL import Image, ImageOps, ImageEnhance, ImageFilter
-    import easyocr
+import os
+import json
+import time
+import re
+import streamlit as st
+from PIL import Image, ImageOps, ImageEnhance, ImageFilter
+import easyocr
 
     # Optional deps used if available
     try:
