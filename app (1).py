@@ -64,7 +64,7 @@ def obtener_respuesta_groq(cliente, texto):
                     "content": prompt,
                 }
             ],
-            model="llama3-8b-8192", # Modelo rápido y eficiente de Groq
+            model="qwen/qwen3-32b", # Modelo rápido y eficiente de Groq
         )
         return chat_completion.choices[0].message.content
     except Exception as e:
