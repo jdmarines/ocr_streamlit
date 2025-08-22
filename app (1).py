@@ -1,211 +1,160 @@
-
-import os
-import json
-import re
 import streamlit as st
-from PIL import Image, ImageOps, ImageEnhance, ImageFilter
+from groq import Groq
 import easyocr
+from PIL import Image
 import numpy as np
+import io
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
+# --- Configuración de la Página ---
+st.set_page_config(
+    page_title="Asistente de Imágenes con IA",
+    page_icon="🤖",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-st.set_page_config(page_title="OCR + LLM Analyzer", page_icon="🧠", layout="centered")
-st.title("🖼️ → 📝 OCR + LLM Analyzer")
-st.caption("Sube una imagen, extrae el texto con OCR y pídele a un LLM (Groq o Hugging Face) que lo analice.")
+# --- Funciones Principales ---
 
-with st.sidebar:
-    st.header("⚙️ Configuración")
-    ocr_langs = st.multiselect(
-        "Idiomas esperados en la imagen (OCR)",
-        options=["es", "en", "pt", "fr", "de", "it"],
-        default=["es", "en"]
-    )
-    contrast_boost = st.slider("Aumentar contraste (%)", 0, 150, 25, step=5)
-    apply_sharpen = st.checkbox("Aplicar nitidez (sharpen)", value=True)
-    provider = st.selectbox("Proveedor LLM", ["Groq", "Hugging Face", "Auto (Groq→HF)"], index=0)
-    model_groq = st.text_input("Modelo Groq", value="llama-3.1-8b-instant")
-    model_hf = st.text_input("Modelo Hugging Face", value="meta-llama/Meta-Llama-3.1-8B-Instruct")
-    temperature = st.slider("Creatividad (temperature)", 0.0, 1.5, 0.3, 0.1)
-    max_tokens = st.number_input("Máx. tokens respuesta", min_value=128, max_value=4096, value=512, step=64)
-    st.markdown("---")
-    st.write("**Variables de entorno (no pegues claves aquí)**")
-    st.code("GROQ_API_KEY=...
-HF_API_TOKEN=...")
+@st.cache_resource
+def cargar_modelo_ocr():
+    """
+    Carga el modelo de EasyOCR en caché para no tener que recargarlo
+    cada vez que se ejecuta el script.
+    """
+    reader = easyocr.Reader(['es', 'en'], gpu=False) # Soporte para español e inglés, sin GPU
+    return reader
 
-uploaded = st.file_uploader("Sube una imagen (PNG/JPG)", type=["png", "jpg", "jpeg"])
-
-def preprocess(img, contrast_boost=25, sharpen=True):
-    img = ImageOps.exif_transpose(img)
-    img = ImageOps.autocontrast(img, cutoff=1)
-    if contrast_boost and contrast_boost > 0:
-        img = ImageEnhance.Color(img).enhance(0.0)  # blanco y negro
-        img = ImageEnhance.Contrast(img).enhance(1 + contrast_boost/100.0)
-    if sharpen:
-        img = img.filter(ImageFilter.UnsharpMask(radius=2, percent=160, threshold=3))
-    return img
-
-@st.cache_resource(show_spinner=False)
-def get_reader(langs):
-    return easyocr.Reader(langs, gpu=False)
-
-def clean_text(s: str) -> str:
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-def analyze_with_groq(prompt: str, model: str, temperature: float, max_tokens: int):
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
-        raise RuntimeError("GROQ_API_KEY no configurada (usa .env o variable de entorno).")
-    from groq import Groq
-    client = Groq(api_key=api_key)
-    completion = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": "Eres un analista lingüístico conciso. Devuelve JSON válido y nada más."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=temperature,
-        max_tokens=max_tokens,
-        response_format={"type": "json_object"},
-    )
-    return completion.choices[0].message.content
-
-def analyze_with_hf(prompt: str, model: str, temperature: float, max_tokens: int):
-    token = os.getenv("HF_API_TOKEN")
-    if not token:
-        raise RuntimeError("HF_API_TOKEN no configurado (usa .env o variable de entorno).")
-    import requests
-    url = f"https://api-inference.huggingface.co/models/{model}"
-    headers = {"Authorization": f"Bearer {token}"}
-    payload = {
-        "inputs": prompt,
-        "parameters": {
-            "max_new_tokens": int(max_tokens),
-            "temperature": float(temperature),
-            "return_full_text": False
-        }
-    }
-    r = requests.post(url, headers=headers, json=payload, timeout=120)
-    if r.status_code != 200:
-        raise RuntimeError(f"Hugging Face API error {r.status_code}: {r.text[:200]}")
-    data = r.json()
-    if isinstance(data, list) and data and "generated_text" in data[0]:
-        return data[0]["generated_text"]
-    if isinstance(data, dict) and "generated_text" in data:
-        return data["generated_text"]
-    return json.dumps(data)
-
-def build_prompt(extracted_text: str):
-    return f'''
-    Analiza el siguiente texto OCR y devuelve **solo** un JSON válido con estas claves:
-    - "idioma": código ISO esperado (es, en, etc.).
-    - "limpio": el texto depurado (sin saltos raros, sin artefactos).
-    - "resumen": resumen en 1-2 oraciones en el mismo idioma detectado.
-    - "sentimiento": "positivo" | "neutral" | "negativo" y "confianza" 0-1.
-    - "entidades": lista de objetos con "tipo" y "texto" (personas, organizaciones, lugares, fechas, montos).
-    - "palabras_clave": lista de 3-8 términos relevantes.
-    - "acciones_sugeridas": lista breve de siguientes pasos (si aplica).
-
-    Texto OCR:
-    """{extracted_text}"""
-    '''
-
-if uploaded:
-    img = Image.open(uploaded).convert("RGB")
-    st.subheader("Vista previa")
-    st.image(img, use_container_width=True)
-
-    pre = preprocess(img, contrast_boost, apply_sharpen)
-    with st.expander("Ver imagen preprocesada"):
-        st.image(pre, use_container_width=True)
-
-    with st.spinner("Ejecutando OCR..."):
-        reader = get_reader(ocr_langs if ocr_langs else ["es", "en"])
-        results = reader.readtext(np.array(pre), detail=1, paragraph=True)
-
-    # results: list of [bbox, text, conf]
+def extraer_texto_de_imagen(imagen_bytes, reader):
+    """
+    Utiliza EasyOCR para extraer texto de una imagen proporcionada en bytes.
+    """
     try:
-        results_sorted = sorted(results, key=lambda r: np.mean([p[1] for p in r[0]]))
-        text = " ".join([r[1] for r in results_sorted])
-    except Exception:
-        text = " ".join([r[1] for r in results])
+        resultado = reader.readtext(imagen_bytes)
+        texto_extraido = " ".join([res[1] for res in resultado])
+        return texto_extraido
+    except Exception as e:
+        st.error(f"Error al procesar la imagen con OCR: {e}")
+        return None
 
-    text = clean_text(text)
-    st.subheader("Texto extraído")
-    if not text:
-        st.warning("No se detectó texto. Revisa la calidad de la imagen o cambia los idiomas de OCR.")
-        st.stop()
-    st.code(text)
+def obtener_respuesta_groq(cliente, texto):
+    """
+    Envía el texto extraído a la API de Groq y obtiene una respuesta del LLM.
+    """
+    if not texto:
+        return "No se pudo extraer texto de la imagen para analizar."
 
-    st.subheader("Análisis con LLM")
-    prompt = build_prompt(text)
+    prompt = f"""
+    Eres un asistente experto en analizar y resumir texto. A continuación, se te proporciona un texto extraído de una imagen.
+    Tu tarea es analizarlo, corregir posibles errores de OCR si es evidente, y proporcionar un resumen claro y conciso o las ideas principales.
+    Si el texto parece ser una pregunta, respóndela. Si son datos, organízalos.
 
-    run_llm = st.button("Analizar con LLM", type="primary")
-    if run_llm:
-        provider_choice = provider
-        last_err = None
-        response_text = None
+    Texto extraído de la imagen:
+    ---
+    {texto}
+    ---
 
-        if provider_choice in ("Groq", "Auto (Groq→HF)"):
-            try:
-                with st.spinner("Consultando Groq..."):
-                    response_text = analyze_with_groq(prompt, model_groq, temperature, max_tokens)
-            except Exception as e:
-                last_err = str(e)
-                if provider_choice == "Groq":
-                    st.error(last_err)
+    Análisis y respuesta:
+    """
 
-        if (response_text is None) and (provider_choice in ("Hugging Face", "Auto (Groq→HF)")):
-            try:
-                with st.spinner("Consultando Hugging Face..."):
-                    response_text = analyze_with_hf(prompt, model_hf, temperature, max_tokens)
-            except Exception as e:
-                last_err = str(e)
+    try:
+        chat_completion = cliente.chat.completions.create(
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
+            model="llama3-8b-8192", # Modelo rápido y eficiente de Groq
+        )
+        return chat_completion.choices[0].message.content
+    except Exception as e:
+        st.error(f"Error al contactar la API de Groq. Verifica tu API Key. Detalle: {e}")
+        return None
 
-        if response_text is None:
-            st.error("No fue posible analizar con LLM. " + (last_err or ""))
-            st.stop()
+# --- Interfaz de Usuario de Streamlit ---
 
-        try:
-            data = json.loads(response_text)
-        except Exception:
-            m = re.search(r"\{[\s\S]*\}", response_text)
-            if m:
-                data = json.loads(m.group(0))
+st.title("🤖 Asistente Inteligente de Imágenes")
+st.markdown("Sube una imagen, y la IA extraerá el texto, lo analizará y te dará una respuesta inteligente.")
+
+# --- Barra Lateral (Sidebar) ---
+with st.sidebar:
+    st.header("🔑 Configuración")
+    st.markdown("Introduce tu API Key de Groq para activar el asistente de IA.")
+    
+    # Campo para la API Key de Groq
+    groq_api_key = st.text_input("Groq API Key", type="password", help="Obtén tu clave desde https://console.groq.com/keys")
+    
+    st.markdown("---")
+    st.header("📄 Instrucciones")
+    st.markdown("""
+    1.  **Ingresa tu API Key** de Groq en el campo de arriba.
+    2.  **Sube una imagen** (JPG, PNG) en el área principal.
+    3.  Haz clic en el botón **"Procesar Imagen"**.
+    4.  Espera a que la IA analice la imagen y te muestre los resultados.
+    """)
+    st.markdown("---")
+    st.info("Tu API Key es privada y no se almacena en ningún lugar.")
+
+
+# --- Área Principal de la Aplicación ---
+col1, col2 = st.columns(2, gap="large")
+
+with col1:
+    st.subheader("🖼️ Carga tu Imagen Aquí")
+    uploaded_file = st.file_uploader(
+        "Selecciona un archivo de imagen", 
+        type=["png", "jpg", "jpeg"],
+        label_visibility="collapsed"
+    )
+
+    if uploaded_file is not None:
+        # Mostrar la imagen cargada
+        image = Image.open(uploaded_file)
+        st.image(image, caption="Imagen cargada", use_column_width=True)
+        
+        # Convertir el archivo a bytes para el procesamiento
+        image_bytes = uploaded_file.getvalue()
+
+        if st.button("✨ Procesar Imagen", use_container_width=True, type="primary"):
+            if not groq_api_key:
+                st.warning("Por favor, introduce tu API Key de Groq en la barra lateral para continuar.")
             else:
-                st.warning("La respuesta no fue JSON válido. Mostrando texto bruto:")
-                st.write(response_text)
-                st.stop()
+                # Inicializar cliente de Groq
+                client = Groq(api_key=groq_api_key)
+                
+                # Cargar modelo OCR
+                reader = cargar_modelo_ocr()
 
-        st.success("¡Análisis listo!")
-        st.json(data)
+                # Procesamiento con OCR
+                with st.spinner("🔍 Extrayendo texto de la imagen..."):
+                    texto_ocr = extraer_texto_de_imagen(image_bytes, reader)
+                
+                if texto_ocr:
+                    st.session_state.texto_ocr = texto_ocr
+                    
+                    # Procesamiento con LLM
+                    with st.spinner("🧠 El asistente de IA está pensando..."):
+                        respuesta_ia = obtener_respuesta_groq(client, texto_ocr)
+                        st.session_state.respuesta_ia = respuesta_ia
+                else:
+                    st.error("No se pudo extraer texto de la imagen. Intenta con otra imagen más clara.")
 
-        st.markdown("### Resultados")
-        col1, col2 = st.columns(2)
-        with col1:
-            idioma = data.get("idioma", "")
-            resumen = data.get("resumen", "")
-            st.markdown(f"**Idioma:** {idioma}")
-            st.markdown(f"**Resumen:** {resumen}")
-            st.markdown(f"**Sentimiento:** {data.get('sentimiento','')} (confianza: {data.get('confianza', data.get('confidence',''))})")
-        with col2:
-            kws = data.get("palabras_clave", [])
-            ents = data.get("entidades", [])
-            if kws:
-                st.markdown("**Palabras clave:** " + ", ".join(kws))
-            if ents:
-                st.markdown("**Entidades detectadas:**")
-                for e in ents:
-                    st.write(f"- {e.get('tipo','?')}: {e.get('texto','')}")
 
-        if data.get("acciones_sugeridas"):
-            st.markdown("### Acciones sugeridas")
-            for a in data["acciones_sugeridas"]:
-                st.write(f"- {a}")
-
-else:
-    st.info("📤 Sube una imagen para comenzar. Formatos admitidos: PNG/JPG.")
+with col2:
+    st.subheader("💡 Resultados del Análisis")
+    if "texto_ocr" in st.session_state and st.session_state.texto_ocr:
+        with st.expander("Ver texto extraído por OCR", expanded=False):
+            st.text_area(
+                "Texto extraído:", 
+                st.session_state.texto_ocr, 
+                height=150,
+                disabled=True
+            )
+    
+    if "respuesta_ia" in st.session_state and st.session_state.respuesta_ia:
+        st.markdown("#### Respuesta del Asistente:")
+        st.markdown(st.session_state.respuesta_ia)
+    else:
+        st.info("Los resultados del análisis de la IA aparecerán aquí después de procesar una imagen.")
+ 
+   
